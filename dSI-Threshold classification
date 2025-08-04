@@ -1,0 +1,216 @@
+# differenced spectral indices are classified using thresholding techniques, otsu, and percentile
+# validation is done by estimating the no of fire pixels falling within each class
+# all delta indices exports need to be uploaded to gee assets
+
+import ee
+import numpy as np
+import skimage.filters
+import geemap
+
+# Initialize GEE
+ee.Authenticate()
+ee.Initialize(project="ee-projectid")
+
+# Define AOI
+aoi = ee.FeatureCollection("projects/ee-projectid/assets/aoi_assetid")
+
+# Load dNBR dataset
+index_name = ee.Image("projects/ee-projectid/assets/Deltaindex_aoi_assetid").clip(aoi)
+
+# Define start and end dates for fire detection
+start_date = '2019-03-04' #pre-fire date
+end_date = '2019-04-16' #post-fire date
+
+# Load Fire dataset (VIIRS VNP14A1)
+fire_dataset = (ee.ImageCollection("NASA/VIIRS/002/VNP14A1")
+                .filterBounds(aoi)
+                .filterDate(start_date, end_date))
+
+# Fire mask (high confidence fire pixels with MaxFRP > 0)
+def fire_mask(image):
+    fire_conf_mask = image.select('FireMask').eq(9)  # High confidence pixels
+    frp_mask = image.select('MaxFRP').gt(0)  # Pixels with FRP > 0
+    return image.updateMask(fire_conf_mask.And(frp_mask)).select("MaxFRP")  # Keep only MaxFRP band
+
+# Apply the fire mask
+high_conf_fire = fire_dataset.map(fire_mask).mean().clip(aoi)  # Mean FRP over time
+
+# Extract fire pixels (binary mask)
+fire_pixel_mask = high_conf_fire.gt(0).selfMask()
+fire_pixel_mask = fire_pixel_mask.addBands(ee.Image.constant(1))  # Add extra band
+
+# Extract centroids of fire pixels
+fire_pixel_centroids = fire_pixel_mask.reduceToVectors(
+    geometry=aoi,
+    geometryType='centroid',
+    reducer=ee.Reducer.first(),  # Fix: Use first() instead of count()
+    scale=1000,  # Match VIIRS resolution
+    maxPixels=1e13
+)
+
+# Compute Multi-Level Otsu Thresholds
+scale = 30
+region_stats = index_name.reduceRegion(
+    reducer=ee.Reducer.toList(),
+    geometry=aoi,
+    scale=scale,
+    bestEffort=True,
+    maxPixels=1e13,
+)
+pixel_values = np.array(region_stats.get("b1").getInfo())
+thresholds = skimage.filters.threshold_multiotsu(pixel_values, classes=4)
+print(f"Multi-Level Otsu Thresholds: {thresholds}")
+th1, th2, th3 = [ee.Number(t) for t in thresholds]
+
+# Multi-Level Otsu Classification
+otsu_classified = (
+    index_name.lt(th1).multiply(0)
+    .add(index_name.gte(th1).And(index_name.lt(th2)).multiply(1))
+    .add(index_name.gte(th2).And(index_name.lt(th3)).multiply(2))
+    .add(index_name.gte(th3).multiply(3))
+)
+
+# Define Burnt (1) and Unburnt (0) Classes
+burnt_class = otsu_classified.gte(1)  # Low to High Severity = Burnt
+
+# Extract fire points falling in Burnt and Unburnt areas
+burnt_fire_points = burnt_class.reduceRegions(
+    collection=fire_pixel_centroids,
+    reducer=ee.Reducer.sum(),
+    scale=10  # Sentinel-2 resolution
+)
+
+# Compute counts
+num_fire_pixels = fire_pixel_centroids.size().getInfo()  # Total fire pixels
+num_burnt_fire_pixels = burnt_fire_points.filter(ee.Filter.gt("sum", 0)).size().getInfo()  # Fire pixels in burnt area
+num_unburnt_fire_pixels = num_fire_pixels - num_burnt_fire_pixels  # Fire pixels in unburnt area
+fire_agreement = (num_burnt_fire_pixels / num_fire_pixels) * 100  # Percentage
+
+# Print results
+print(f"Total Fire Pixels: {num_fire_pixels}")
+print(f"Fire Pixels in Burnt Area: {num_burnt_fire_pixels}")
+print(f"Fire Pixels in Unburnt Area: {num_unburnt_fire_pixels}")
+print(f"Percentage of Fire Pixels in Burnt Area: {fire_agreement:.2f}%")
+
+# Compute percentiles within GEE
+percentile_dict = index_name.reduceRegion(
+    reducer=ee.Reducer.percentile([25, 50, 75]),
+    geometry=index_name.geometry(),
+    scale=30,  # Change scale based on resolution
+    bestEffort=True
+)
+
+# Extract values correctly
+p1 = ee.Number(percentile_dict.get("b1_p25"))
+p2 = ee.Number(percentile_dict.get("b1_p50"))
+p3 = ee.Number(percentile_dict.get("b1_p75"))
+
+# Print values
+print(f"Percentile-Based Thresholds: 25%={p1.getInfo()}, 50%={p2.getInfo()}, 75%={p3.getInfo()}")
+
+# Multi-Level Percentile Classification
+percentile_classified = (
+    index_name.lt(p1).multiply(0)
+    .add(index_name.gte(p1).And(index_name.lt(p2)).multiply(1))
+    .add(index_name.gte(p2).And(index_name.lt(p3)).multiply(2))
+    .add(index_name.gte(p3).multiply(3))
+)
+
+# Define Burnt (1) and Unburnt (0) Classes for Percentile Classification
+burnt_class_percentile = percentile_classified.gte(1)  # Low to High Severity = Burnt
+
+# Extract fire points falling in Burnt and Unburnt areas for Percentile Classification
+burnt_fire_points_percentile = burnt_class_percentile.reduceRegions(
+    collection=fire_pixel_centroids,
+    reducer=ee.Reducer.sum(),
+    scale=10  # Sentinel-2 resolution
+)
+
+# Compute fire pixel agreement for Percentile Classification
+num_burnt_fire_pixels_percentile = burnt_fire_points_percentile.filter(ee.Filter.gt("sum", 0)).size().getInfo()
+num_unburnt_fire_pixels_percentile = num_fire_pixels - num_burnt_fire_pixels_percentile
+fire_agreement_percentile = (num_burnt_fire_pixels_percentile / num_fire_pixels) * 100
+
+# Print comparison results
+print("\nComparison of Burnt Area Classification")
+print(f"Otsu Thresholding:")
+print(f"Fire Pixels in Burnt Area: {num_burnt_fire_pixels}")
+print(f"Fire Pixels in Unburnt Area: {num_unburnt_fire_pixels}")
+print(f"Percentage of Fire Pixels in Burnt Area: {fire_agreement:.2f}%\n")
+
+print(f"Percentile Thresholding:")
+print(f"Fire Pixels in Burnt Area: {num_burnt_fire_pixels_percentile}")
+print(f"Fire Pixels in Unburnt Area: {num_unburnt_fire_pixels_percentile}")
+print(f"Percentage of Fire Pixels in Burnt Area: {fire_agreement_percentile:.2f}%")
+
+# Define pixel area in hectares (ha) and square kilometers (km²)
+pixel_area_ha = 0.01  # Each Sentinel-2 pixel = 10m x 10m = 0.01 ha
+pixel_area_km2 = 0.0001  # Each Sentinel-2 pixel = 0.0001 km²
+
+# Compute burnt area for Otsu Classification
+burnt_pixels_otsu = burnt_class.multiply(ee.Image.pixelArea()).divide(10000)  # Convert m² to ha
+burnt_area_otsu_ha = burnt_pixels_otsu.reduceRegion(
+    reducer=ee.Reducer.sum(),
+    geometry=aoi,
+    scale=10,
+    bestEffort=True,
+    maxPixels=1e13
+).getInfo()['b1']
+
+burnt_area_otsu_km2 = burnt_area_otsu_ha * 0.01  # Convert ha to km²
+
+# Compute burnt area for Percentile Classification
+burnt_pixels_percentile = burnt_class_percentile.multiply(ee.Image.pixelArea()).divide(10000)  # Convert m² to ha
+burnt_area_percentile_ha = burnt_pixels_percentile.reduceRegion(
+    reducer=ee.Reducer.sum(),
+    geometry=aoi,
+    scale=10,
+    bestEffort=True,
+    maxPixels=1e13
+).getInfo()['b1']
+
+burnt_area_percentile_km2 = burnt_area_percentile_ha * 0.01  # Convert ha to km²
+
+# Print results
+print("\nBurnt Area Computation")
+print(f"Otsu Thresholding:")
+print(f"Burnt Area: {burnt_area_otsu_ha:.2f} ha ({burnt_area_otsu_km2:.2f} km²)")
+
+print(f"Percentile Thresholding:")
+print(f"Burnt Area: {burnt_area_percentile_ha:.2f} ha ({burnt_area_percentile_km2:.2f} km²)")
+
+# **Step 2: Visualization**
+Map = geemap.Map()
+Map.centerObject(aoi, 9)
+Map.addLayer(aoi, {}, "AOI")
+Map.addLayer(otsu_classified, {"min": 0, "max": 3, "palette": ["white", "yellow", "orange", "red"]}, "Burn Severity")
+Map.addLayer(percentile_classified, {"min": 0, "max": 3, "palette": ["white", "yellow", "orange", "red"]}, "Percentile Burn Severity")
+Map.addLayer(burnt_class.selfMask(), {"palette": "red"}, "Burnt Area (Otsu)")
+Map.addLayer(burnt_class_percentile.selfMask(), {"palette": "blue"}, "Burnt Area (Percentile)")
+Map.addLayer(fire_pixel_centroids, {"color": "black"}, "Fire Pixel Centroids")
+Map
+
+# Output below
+Multi-Level Otsu Thresholds: [-0.25223301 -0.0736338  -0.00036233]
+Total Fire Pixels: 56
+Fire Pixels in Burnt Area: 55 
+Fire Pixels in Unburnt Area: 1
+Percentage of Fire Pixels in Burnt Area: 98.21%
+Percentile-Based Thresholds: 25%=-0.08199247451119479, 50%=-0.042960512899555964, 75%=0.003853387394228273
+
+Comparison of Burnt Area Classification
+Otsu Thresholding:
+Fire Pixels in Burnt Area: 55
+Fire Pixels in Unburnt Area: 1
+Percentage of Fire Pixels in Burnt Area: 98.21%
+
+Percentile Thresholding:
+Fire Pixels in Burnt Area: 47
+Fire Pixels in Unburnt Area: 9
+Percentage of Fire Pixels in Burnt Area: 83.93%
+
+Burnt Area Computation
+Otsu Thresholding:
+Burnt Area: 152259.45 ha (1522.59 km²)
+Percentile Thresholding:
+Burnt Area: 115988.70 ha (1159.89 km²)
