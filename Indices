@@ -7,10 +7,10 @@ import geemap
 
 # Authenticate and initialize GEE
 ee.Authenticate()
-ee.Initialize(project='ee-anishamajorproject')
+ee.Initialize(project='ee-projectid')
 
 # Define AOI
-AOI8 = ee.FeatureCollection('projects/ee-anishamajorproject/assets/Mizoram_LL')
+AOI8 = ee.FeatureCollection('projects/ee-projectid/assets/aoi_assetid')
 
 # Function to mask clouds using Sentinel-2 QA60 band
 def maskS2clouds(image):
